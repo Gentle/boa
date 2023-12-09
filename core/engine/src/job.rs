@@ -20,7 +20,8 @@
 use std::{cell::RefCell, collections::VecDeque, fmt::Debug, future::Future, pin::Pin};
 
 use crate::{
-    object::{JsFunction, NativeObject},
+    builtins::promise::PromiseState,
+    object::{JsFunction, JsPromise, NativeObject},
     realm::Realm,
     Context, JsResult, JsValue,
 };
@@ -295,6 +296,24 @@ impl SimpleJobQueue {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Run jobs until a given Promise is not Pending anymore
+    pub fn run_jobs_until_promise(&self, context: &mut Context, promise: &JsPromise) {
+        if !matches!(promise.state(), PromiseState::Pending) {
+            return;
+        }
+        let mut next_job = self.0.borrow_mut().pop_front();
+        while let Some(job) = next_job {
+            if job.call(context).is_err() {
+                self.0.borrow_mut().clear();
+                return;
+            };
+            if !matches!(promise.state(), PromiseState::Pending) {
+                return;
+            }
+            next_job = self.0.borrow_mut().pop_front();
+        }
+    }
 }
 
 impl JobQueue for SimpleJobQueue {
@@ -318,5 +337,39 @@ impl JobQueue for SimpleJobQueue {
     fn enqueue_future_job(&self, future: FutureJob, context: &mut Context) {
         let job = pollster::block_on(future);
         self.enqueue_promise_job(job, context);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use crate::{builtins::promise::PromiseState, js_string, object::JsPromise, Context, JsValue};
+
+    use super::SimpleJobQueue;
+
+    #[test]
+    fn test_job_queue_run_promise() {
+        let job_queue = Rc::new(SimpleJobQueue::default());
+        let context = &mut Context::builder()
+            .job_queue(job_queue.clone())
+            .build()
+            .unwrap();
+
+        let promise = JsPromise::new(
+            |resolvers, context| {
+                let result = js_string!("hello world!").into();
+                resolvers
+                    .resolve
+                    .call(&JsValue::undefined(), &[result], context)?;
+                Ok(JsValue::undefined())
+            },
+            context,
+        );
+        job_queue.run_jobs_until_promise(context, &promise);
+        assert_eq!(
+            promise.state(),
+            PromiseState::Fulfilled(JsValue::String(js_string!("hello world!")))
+        );
     }
 }
